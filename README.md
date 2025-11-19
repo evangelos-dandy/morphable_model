@@ -1,2 +1,3 @@
 # morphable_model
-# morphable_model
+
+source ../orthlyml/.venv/bin/activate
