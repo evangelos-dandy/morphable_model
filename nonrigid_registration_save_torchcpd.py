@@ -1,12 +1,22 @@
 # %%
+import argparse
+import copy
+import numpy as np
+import open3d as o3d
 import h5py
 import matplotlib.pyplot as plt
+import torch
 
 hdf5_filepath = "/home/evangelos.sariyanidi/data/smaller_context_canonical_anterior_audits_1946.hdf5"
 hdf5_dataset = h5py.File(hdf5_filepath, "r")
 
 indices = list(hdf5_dataset["data/tooth_8"])
 
+parser = argparse.ArgumentParser()
+parser.add_argument("crown_index", type=int, default=80)
+args = parser.parse_args()
+
+crown_index = args.crown_index
 
 def return_mesh(index, align_to_canonical=True):
     crown_parent = hdf5_dataset["data/tooth_8/" + indices[index]]
@@ -37,16 +47,13 @@ def plot_pts(Ps, start_new_plot=True):
         plt.plot(P[2, :], P[1, :], ".", alpha=0.1)
         plt.xlabel("z")
         plt.ylabel("y")
-    plt.show()
+    #
+    # plt.show()
 
-
-import copy
-import numpy as np
-import open3d as o3d
 
 # Create the Mesh3d trace
 P0, F0 = return_mesh(0)
-P1, F1 = return_mesh(1)
+P1, F1 = return_mesh(crown_index)
 
 
 def chamfer_distance(pcd1, pcd2):
@@ -78,7 +85,7 @@ target_pts = P1.T
 target_faces = F1.T
 
 
-def ICP(source_pts, target_pts, voxel_size=0.2, scaling=True):
+def ICP(source_pts, target_pts, voxel_size=0.3, scaling=True):
     source = o3d.geometry.PointCloud()
     source.points = o3d.utility.Vector3dVector(source_pts)
 
@@ -119,24 +126,24 @@ def ICP(source_pts, target_pts, voxel_size=0.2, scaling=True):
     source_transformed = source.transform(result.transformation)
     CD = chamfer_distance(source_transformed, target)
     print(CD)
-    return np.asarray(source_transformed.points).T, CD
+    return np.asarray(source_transformed.points).T, CD, result.transformation
 
 
 P0, F0 = return_mesh(0)
-P1, F1 = return_mesh(80)
+P1, F1 = return_mesh(crown_index)
 
+std_ratio = P0.std(axis=1).reshape(3, 1) / P1.std(axis=1).reshape(3, 1)
+P1 *= std_ratio
+P1r, CD, rigid_transformation = ICP(P1.T, P0.T, scaling=True, voxel_size=0.3)
 
-P1 *= P0.std(axis=1).reshape(3, 1) / P1.std(axis=1).reshape(3, 1)
-P1r, CD = ICP(P1.T, P0.T, scaling=True, voxel_size=0.3)
 
 
 #
-plot_pts([P0, P1])
-plot_pts([P0, P1r])
+#plot_pts([P0, P1])
+#plot_pts([P0, P1r])
 
 # %%
 
-from probreg import cpd
 
 source = o3d.geometry.TriangleMesh()
 source.vertices = o3d.utility.Vector3dVector(P1.T)
@@ -148,6 +155,19 @@ target.vertices = o3d.utility.Vector3dVector(P0.T)
 target.triangles = o3d.utility.Vector3iVector(F0.T)
 # %%
 
+
+def o3d_to_torch(pc):
+    return torch.tensor(np.asarray(pc.points), dtype=torch.float32, device="cpu")
+
+
+def torch_to_o3d(t):
+    # t is a torch tensor (cuda or cpu)
+    arr = t.detach().cpu().numpy().astype(np.float64)  # Open3D needs float64
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(arr)
+    return pcd
+
+
 # Optional: ensure normals etc.
 source.compute_vertex_normals()
 target.compute_vertex_normals()
@@ -156,8 +176,26 @@ target.compute_vertex_normals()
 # adjust number_of_points as needed
 o3d.utility.random.seed(42)
 
-source_pcd = source.sample_points_uniformly(number_of_points=4000)
-target_pcd = target.sample_points_uniformly(number_of_points=4000)
+indices_source = np.random.choice(len(source.vertices), size=10000, replace=False)
+indices_target = np.random.choice(len(target.vertices), size=10000, replace=False)
+
+source_pcd = o3d.geometry.PointCloud()
+source_pcd.points = o3d.utility.Vector3dVector(np.asarray(source.vertices)[indices_source])
+source_pcd.normals = o3d.utility.Vector3dVector(np.asarray(source.vertex_normals)[indices_source])
+
+target_pcd = o3d.geometry.PointCloud()
+target_pcd.points = o3d.utility.Vector3dVector(np.asarray(target.vertices)[indices_target])
+target_pcd.normals = o3d.utility.Vector3dVector(np.asarray(target.vertex_normals)[indices_target])
+
+"""
+source_pcd = o3d.geometry.PointCloud()
+source_pcd.points = source.vertices
+source_pcd.normals = source.vertex_normals
+target_pcd = o3d.geometry.PointCloud()
+target_pcd.points = target.vertices
+target_pcd.normals = target.vertex_normals
+
+"""
 print(np.asarray(source_pcd.points))
 # %%
 """
@@ -168,6 +206,7 @@ target_pcd = o3d.geometry.PointCloud()
 target_pcd.points = target.vertices
 target_pcd.normals = target.vertex_normals
 """
+from torchcpd import DeformableRegistration
 
 # (optional) remove NaNs / infs
 # source_pcd.remove_non_finite_points()
@@ -177,24 +216,48 @@ import time
 t0 = time.time()
 # --- Run non-rigid CPD (probreg handles Open3D <-> numpy) ---
 # beta, lmd are the usual CPD non-rigid parameters
-res = cpd.registration_cpd(
-    source=source_pcd,
-    target=target_pcd,
-    tf_type_name="nonrigid",  # <- this selects non-rigid CPD
-    w=0.1,  # noise / outlier weight
-    maxiter=50,
-    tol=1e-5,
-    beta=2.0,
-    lmd=3.0,
-)
+
+X = o3d_to_torch(target_pcd)  # fixed
+Y = o3d_to_torch(source_pcd)  # moving
+
+reg = DeformableRegistration(
+    X=X.numpy(),
+    Y=Y.numpy(),
+    alpha=2.0,  # smoothness
+    beta=2.0,  # kernel width
+    w=0.0,  # outlier weight
+    max_iterations=75,
+    tolerance=1e-5,
+)  # .cuda()
+
+TY, (G, W) = reg.register()
+
+warped = torch_to_o3d(TY)
+
 t1 = time.time()
 print(f"Time taken: {t1 - t0} seconds")
 
 # res.transformation is a probreg.NonRigidTransformation
 # It can directly transform Open3D point data:
-aligned_source_pcd = copy.deepcopy(source_pcd)
-aligned_source_pcd.points = res.transformation.transform(source_pcd.points)
+aligned_source_pcd = copy.deepcopy(warped)
+# %%
+# aligned_source_pcd.points = res.transformation.transform(source_pcd.points)
 plot_pts([np.asarray(aligned_source_pcd.points).T, np.asarray(target_pcd.points).T])
+plt.savefig(f"/home/evangelos.sariyanidi/output/cpd/nonrigid_registration_save_{crown_index}.png")
+
+
+out = {
+    'std_ratio': std_ratio,
+    'rigid_transformation': rigid_transformation,
+    'source_rigid_aligned': P1r.T,
+    'indices_source': indices_source,
+    'indices_target': indices_target,
+    'source_warped': TY
+}
+
+np.save(f"/home/evangelos.sariyanidi/output/cpd/nonrigid_registration_save_{crown_index}.npy", out)
+
+
 
 # --- (Optional) visualize ---
 # o3d.visualization.draw_geometries(
@@ -203,3 +266,7 @@ plot_pts([np.asarray(aligned_source_pcd.points).T, np.asarray(target_pcd.points)
 #        target_pcd.paint_uniform_color([0, 1, 0]),
 #    ]
 # )
+
+# %%
+
+# %%
