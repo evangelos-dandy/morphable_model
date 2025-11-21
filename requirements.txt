@@ -1,4 +1,6 @@
 open3d
 h5py
 probreg
-
+imageio
+imageio-ffmpeg
+opencv-python
