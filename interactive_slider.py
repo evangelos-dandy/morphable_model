@@ -6,6 +6,13 @@ import os
 
 import joblib
 
+import numpy as np
+import plotly.graph_objs as go
+from ipywidgets import FloatSlider, VBox, HBox, Button
+
+from IPython.display import display
+
+
 if not os.path.exists("saved_models"):
     os.makedirs("saved_models")
 
@@ -123,12 +130,6 @@ pcs = pcs_flat.reshape(K, -1, 3)  # -> (K, N, 3)
 
 
 #%%
-
-import numpy as np
-import plotly.graph_objs as go
-from ipywidgets import FloatSlider, VBox, HBox, Button
-
-from IPython.display import display
 
 
 mean_vertices = mean_vertices.astype(np.float32)
@@ -249,3 +250,4 @@ reset_btn.on_click(on_reset_clicked)
 ui = HBox([VBox([reset_btn] + sliders), fig])
 
 display(ui)
+# %%

@@ -4,3 +4,4 @@ probreg
 imageio
 imageio-ffmpeg
 opencv-python
+seaborn
