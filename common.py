@@ -8,9 +8,72 @@ from scipy.spatial import cKDTree
 
 from scipy.spatial.distance import pdist, squareform
 import copy
+import cv2
 
 import open3d as o3d
 
+
+
+class Open3DRenderer:
+    def __init__(self, width: int = 400, height: int = 400):
+        self.renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
+        self.material = o3d.visualization.rendering.MaterialRecord()
+        self.material.shader = "defaultLit"
+
+    """
+    def add_geometry(self, name, geometry, material):
+        self.scene.add_geometry(name, geometry, material)
+    
+    def setup_camera(self, fov, center, cam_pos, up_vec, near_clip, far_clip):
+        self.renderer.setup_camera(fov, center, cam_pos, up_vec, near_clip, far_clip)
+    """
+    def render_to_image(self, mesh, target_fpath=None):
+        self.renderer.scene.clear_geometry()
+        mesh.compute_vertex_normals()
+
+        self.renderer.scene.add_geometry("mesh", mesh, self.material)
+        bbox = mesh.get_axis_aligned_bounding_box()
+
+        center = bbox.get_center()
+        extent = bbox.get_extent()
+        radius = np.linalg.norm(extent) * 0.5
+        up_vec = np.array([0, 1, 0])
+
+        cam_pos = center + np.array([0, 0, radius * 2])
+
+        # Make sure these are float32 for Open3D
+        center = center.astype(np.float32)
+        cam_pos = cam_pos.astype(np.float32)
+        up_vec = up_vec.astype(np.float32)
+
+        # ---- FIX IS HERE: pass center, eye, up (no bbox) ----
+        self.renderer.setup_camera(
+            60.0,         # vertical FOV in degrees
+            center+np.array([0, 0, 0]),       # look-at center
+            cam_pos,      # camera position (eye)
+            up_vec,       # up vector
+            -1.0,         # near clip (auto if -1)
+            -1.0,         # far clip (auto if -1)
+        )
+        # Render to image
+        img = self.renderer.render_to_image()
+
+        if target_fpath is not None:
+            # Save PNG
+            o3d.io.write_image(target_fpath, img)
+        
+        return img
+
+    def render_to_image_multi(self, meshes, target_fpath=None):
+        imgs = []
+        for mesh in meshes:
+            imgs.append(self.render_to_image(mesh, target_fpath=None))
+        
+        imgs = np.concatenate([np.asarray(img) for img in imgs], axis=1)
+        if target_fpath is not None:
+    #        o3d.io.write_image(target_fpath, imgs)
+            cv2.imwrite(target_fpath, imgs)
+        return np.asarray(imgs)
 
 
 def return_mesh(hdf5_dataset, indices, index, align_to_canonical=True):
@@ -34,12 +97,12 @@ def plot_pts(Ps, start_new_plot=True):
         plt.subplots(1, 2, figsize=(10, 5))
     plt.subplot(1, 2, 1)
     for P in Ps:
-        plt.plot(P[0, :], P[1, :], ".", alpha=0.1)
+        plt.plot(P[:, 0], P[:, 1], ".", alpha=0.1)
         plt.xlabel("x")
         plt.ylabel("y")
     plt.subplot(1, 2, 2)
     for P in Ps:
-        plt.plot(P[2, :], P[1, :], ".", alpha=0.1)
+        plt.plot(P[:, 2], P[:, 1], ".", alpha=0.1)
         plt.xlabel("z")
         plt.ylabel("y")
 
@@ -81,6 +144,16 @@ def chamfer_distance_gpu(pts1: np.ndarray,
     # choose device
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
+
+    if isinstance(pts1, o3d.geometry.PointCloud):
+        pts1 = np.asarray(pts1.points)
+    if isinstance(pts2, o3d.geometry.PointCloud):
+        pts2 = np.asarray(pts2.points)
+    
+    if isinstance(pts1, o3d.geometry.TriangleMesh):
+        pts1 = np.asarray(pts1.vertices)
+    if isinstance(pts2, o3d.geometry.TriangleMesh):
+        pts2 = np.asarray(pts2.vertices)
 
     # convert numpy → torch
     x = torch.tensor(pts1, dtype=torch.float64, device=device)
@@ -166,7 +239,7 @@ def ICP(source_pts, target_pts, voxel_size=0.3, scaling=True):
     source_ds = source.voxel_down_sample(voxel_size)
     target_ds = target.voxel_down_sample(voxel_size)
 
-    print(np.asarray(source_ds.points).shape, np.asarray(target_ds.points).shape)
+    ###print(np.asarray(source_ds.points).shape, np.asarray(target_ds.points).shape)
 
     # Initial transform (identity if you have no guess)
     init_transform = np.eye(4)
@@ -185,20 +258,92 @@ def ICP(source_pts, target_pts, voxel_size=0.3, scaling=True):
         ),
     )
 
-    print("Fitness:", result.fitness)
+    ###print("Fitness:", result.fitness)
     #    print("Inlier RMSE:", result.inlier_rmse)
     # print("Transformation:\n", result.transformation)
 
     # plot_pts([np.asarray(source_ds.points).T, np.asarray(target_ds.points).T])
 
     # Apply to the original high-res source
-    print(chamfer_distance(source, target))
+    CD_before = chamfer_distance_gpu(source, target)
     source_transformed = source.transform(result.transformation)
-    CD = chamfer_distance(source_transformed, target)
-    print(CD)
-    return np.asarray(source_transformed.points).T, CD, result.transformation
+    CD_after = chamfer_distance_gpu(source_transformed, target)
+    return np.asarray(source_transformed.points), CD_before, CD_after, result.transformation
 
-def align(R, Glmks, lmk_indices):
+
+
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import shortest_path
+
+import numpy as np
+from scipy.sparse import coo_matrix
+
+def build_mesh_graph(vertices, faces):
+    """
+    vertices: (N, 3)
+    faces:    (M, 3) int
+    returns:  csr_matrix adjacency with edge lengths as weights
+    """
+    i = faces[:, [0, 1, 2]]
+    j = faces[:, [1, 2, 0]]
+
+    # all directed edges (i->j and j->i)
+    I = np.hstack([i[:, 0], i[:, 1], i[:, 2], j[:, 0], j[:, 1], j[:, 2]])
+    J = np.hstack([j[:, 0], j[:, 1], j[:, 2], i[:, 0], i[:, 1], i[:, 2]])
+
+    P = vertices[I]
+    Q = vertices[J]
+    lengths = np.linalg.norm(P - Q, axis=1)
+
+    n = len(vertices)
+    A = coo_matrix((lengths, (I, J)), shape=(n, n))
+    return A.tocsr()
+
+
+from scipy.sparse.csgraph import shortest_path
+from scipy.spatial.distance import squareform
+
+def geodesic_pdist(vertices, faces, method="D"):
+    """
+    Rough geodesic analogue of scipy.spatial.distance.pdist for a mesh.
+    Returns condensed-form distances (like pdist).
+    """
+    graph = build_mesh_graph(vertices, faces)
+
+    # All-pairs shortest paths: (N, N) geodesic distance matrix
+    D = shortest_path(
+        csgraph=graph,
+        directed=False,
+        unweighted=False,
+        method=method  # 'D' (Dijkstra) or 'FW' etc.
+    )
+
+    # Convert (N, N) symmetric matrix to condensed form (same shape as pdist)
+    d_condensed = squareform(D)
+    return d_condensed
+
+
+from scipy.sparse.csgraph import shortest_path
+from scipy.sparse import coo_matrix
+
+def multi_source_geodesic(vertices, faces, sources):
+    graph = build_mesh_graph(vertices, faces)  # from earlier
+    sources = np.asarray(sources, dtype=int)
+    D = shortest_path(
+        csgraph=graph,
+        directed=False,
+        unweighted=False,
+        indices=sources,
+        method='D',
+    )
+    # D.shape == (k, N)
+    return D
+    
+def angular_dist(u, v):
+    # assume unit vectors; clamp for numerical stability
+    return np.clip(np.dot(u, v), -1.0, 1.0)
+
+def align(R, Glmks, lmk_indices, filter_by_normals=False, RN=None, normal_threshold=0.25):
 
     def solve_optimization_problem(D, Dl, b):
         np.random.seed(1907)
@@ -218,6 +363,13 @@ def align(R, Glmks, lmk_indices):
     for j in range(Dx.shape[1]):
         Dx[:,j] = 1-Dx[:,j]/Dx[:,j].max()
     
+
+    if filter_by_normals:
+        dots = RN @ RN.T                      # (N, N)
+        Us = np.clip(dots, -1.0, 1.0)     # numerical stability
+        Us = Us[:,lmk_indices]
+        Dx[Us<normal_threshold] = 0
+
     Dx = Dx
     Dy = Dx
     Dz = Dx
@@ -242,6 +394,7 @@ def align(R, Glmks, lmk_indices):
     R2[:,2] = R[:,2] + Dz@dzu
     
     return R2
+
 
 
 
@@ -358,4 +511,103 @@ def anisotropic_align(A, B, n_iters: int = 10):
     A_aligned = (R @ A_scaled.T).T + t  # (N,3)
 
     return A_aligned, R, s, t, T
+
+
+import plotly.graph_objects as go
+
+def plot_mesh(verts, faces):
+    i, j, k = faces.T
+    mesh = go.Mesh3d(
+        x=verts[:, 0],
+        y=verts[:, 1],
+        z=verts[:, 2],
+        i=i,
+        j=j,
+        k=k,
+        color="lightblue",
+
+        # --- LIGHTING ---
+        lighting=dict(
+            ambient=0.4,
+            diffuse=0.9,
+            specular=0.5,
+            roughness=0.3,
+            fresnel=0.1,
+        ),
+        lightposition=dict(
+            x=0,
+            y=0,
+            z=-1.0  # light from above
+        ),
+        flatshading=False,
+        opacity=0.4,
+    )
+    fig = go.FigureWidget(data=[mesh])
+    fig.update_layout(
+        width=400,
+        height=400,
+        scene=dict(
+            aspectmode="data",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+            scene_camera=dict(
+            eye=dict(x=-0.002, y=-0.018, z=2.135),
+            center=dict(x=0, y=0, z=0),
+            up=dict(x=0, y=0, z=1),
+        )
+    )
+    return fig
+
+
+def plot_meshes(vert_face_pairs, opacity=0.4):
+    meshes = []
+    for verts, faces in vert_face_pairs:
+        i, j, k = faces.T
+        mesh = go.Mesh3d(
+            x=verts[:, 0],
+            y=verts[:, 1],
+            z=verts[:, 2],
+            i=i,
+            j=j,
+            k=k,
+            color="lightblue",
+
+            # --- LIGHTING ---
+            lighting=dict(
+                ambient=0.4,
+                diffuse=0.9,
+                specular=0.5,
+                roughness=0.3,
+                fresnel=0.1,
+            ),
+            lightposition=dict(
+                x=0,
+                y=0,
+                z=-1.0  # light from above
+            ),
+            flatshading=False,
+            opacity=opacity,
+        )
+        meshes.append(mesh)
+    fig = go.FigureWidget(data=meshes)
+    fig.update_layout(
+        width=400,
+        height=400,
+        scene=dict(
+            aspectmode="data",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+            scene_camera=dict(
+            eye=dict(x=-0.002, y=-0.018, z=2.135),
+            center=dict(x=0, y=0, z=0),
+            up=dict(x=0, y=0, z=1),
+        )
+    )
+    return fig
 

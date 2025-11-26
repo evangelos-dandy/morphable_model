@@ -5,3 +5,6 @@ imageio
 imageio-ffmpeg
 opencv-python
 seaborn
+trimesh
+rtree
+kaleido
