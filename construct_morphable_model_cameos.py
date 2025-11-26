@@ -19,9 +19,9 @@ cameo_perceived_mask = ref['cameo_perceived_mask']
 
 #%%
 
-input_dir = '/data/tooth_8_cameos_and_line_angles_common_topology'
+input_dir = '/data/tooth_8_cameos_and_line_angles_common_topology_with_la'
 uuids = list([x.split(".")[0] for x in os.listdir(input_dir)])
-    
+uuids.sort()
 
 #%%
 
@@ -30,7 +30,10 @@ alignment_method = "rigid"
 #alignment_method = "rigid+anisotropic"
 
 reg_meshes = [V0]
-for crown_relative_index in range(len(uuids)):
+Ntra = 1500
+assert Ntra < len(uuids)
+tra_uuids = []
+for crown_relative_index in range(Ntra):
     print(f"\rProcessing crown {crown_relative_index}", end="")
     fp = os.path.join(input_dir, f"{uuids[crown_relative_index]}.npy")
     if not os.path.exists(fp):
@@ -47,7 +50,7 @@ for crown_relative_index in range(len(uuids)):
         Vr = anisotropic_align(rigid_align(V, V0)[0], V0)[0]
 
     reg_meshes.append(Vr)
-
+    tra_uuids.append(uuids[crown_relative_index])
 print()
 #plot_pts([Pi.T, P0.T])
 plot_pts([V, V0])
@@ -58,17 +61,18 @@ import joblib
 
 if not os.path.exists("saved_models"):
     os.makedirs("saved_models")
-
-X = np.stack(reg_meshes[:-10])
+    
+X = np.stack(reg_meshes)
 X = X.reshape(X.shape[0], -1)
-
+var = 0.999
 from sklearn.decomposition import PCA
-pca_path = "saved_models/pca_model_cameos.pkl"
+pca_path = f"saved_models/pca_model_cameos_{Ntra}scans_var{var}.pkl"
 if os.path.exists(pca_path):
     pca = joblib.load(pca_path)
 else:
-    pca = PCA(n_components=0.99, svd_solver="full")
+    pca = PCA(n_components=var, svd_solver="full")
     pca.fit(X)
+    pca.tra_uuids = tra_uuids
     joblib.dump(pca, pca_path)
 
 latents = pca.transform(X)
